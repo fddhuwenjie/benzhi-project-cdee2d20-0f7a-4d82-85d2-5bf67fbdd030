@@ -22,7 +22,9 @@ func (t *transaction) LoadMission(ctx context.Context, id string) (*mission.Dive
 
 func (s *Store) Mission(ctx context.Context, id string) (*mission.DiveMission, error) {
 	lock := s.missionLock("__mission_transactions__")
-	lock.Lock()
+	if err := lock.Lock(ctx); err != nil {
+		return nil, err
+	}
 	defer lock.Unlock()
 	m, err := loadMission(ctx, s.db, id)
 	if err != nil {
@@ -42,7 +44,9 @@ func (s *Store) Mission(ctx context.Context, id string) (*mission.DiveMission, e
 
 func (s *Store) MissionUnverified(ctx context.Context, id string) (*mission.DiveMission, error) {
 	lock := s.missionLock("__mission_transactions__")
-	lock.Lock()
+	if err := lock.Lock(ctx); err != nil {
+		return nil, err
+	}
 	defer lock.Unlock()
 	return loadMission(ctx, s.db, id)
 }
@@ -209,7 +213,9 @@ func (t *transaction) ScheduleConflictsExcluding(ctx context.Context, siteKey st
 
 func (s *Store) SchedulePreflight(ctx context.Context, siteKey string, start, end time.Time) ([]mission.ScheduleConflict, error) {
 	lock := s.missionLock("__mission_transactions__")
-	lock.Lock()
+	if err := lock.Lock(ctx); err != nil {
+		return nil, err
+	}
 	defer lock.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

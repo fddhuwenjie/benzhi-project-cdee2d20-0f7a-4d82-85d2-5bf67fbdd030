@@ -14,6 +14,37 @@ type Store struct {
 	locks sync.Map
 }
 
+// ctxMutex 是一个支持上下文取消的互斥锁。
+// 当调用者正在等待获取锁时，如果传入的 context 被取消，
+// Lock 会立即返回 context 对应的错误而不是继续阻塞。
+// 内部使用带缓冲的 channel 作为令牌：持有锁即拥有令牌，
+// Unlock 将令牌放回 channel，等待者通过 select 竞争令牌或取消信号。
+type ctxMutex struct {
+	token chan struct{}
+}
+
+func newCtxMutex() *ctxMutex {
+	m := &ctxMutex{token: make(chan struct{}, 1)}
+	m.token <- struct{}{}
+	return m
+}
+
+// Lock 尝试获取锁。如果 ctx 在获得锁之前被取消，返回 ctx.Err()。
+// 获取锁成功后返回 nil。调用者必须在获取成功后调用 Unlock。
+func (m *ctxMutex) Lock(ctx context.Context) error {
+	select {
+	case <-m.token:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Unlock 释放锁。
+func (m *ctxMutex) Unlock() {
+	m.token <- struct{}{}
+}
+
 func Open(ctx context.Context, path string) (*Store, error) {
 	dsn := path
 	if path != ":memory:" {
@@ -40,9 +71,9 @@ func Open(ctx context.Context, path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-func (s *Store) missionLock(id string) *sync.Mutex {
-	value, _ := s.locks.LoadOrStore(id, &sync.Mutex{})
-	return value.(*sync.Mutex)
+func (s *Store) missionLock(id string) *ctxMutex {
+	value, _ := s.locks.LoadOrStore(id, newCtxMutex())
+	return value.(*ctxMutex)
 }
 
 func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }

@@ -14,7 +14,9 @@ type transaction struct{ tx *sql.Tx }
 func (s *Store) Execute(ctx context.Context, missionID, requestID, operation, fingerprint string, fn func(mission.Tx) (mission.StoredResult, error)) (mission.StoredResult, bool, error) {
 	lockKey := "__mission_transactions__"
 	lock := s.missionLock(lockKey)
-	lock.Lock()
+	if err := lock.Lock(ctx); err != nil {
+		return mission.StoredResult{}, false, err
+	}
 	defer lock.Unlock()
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
