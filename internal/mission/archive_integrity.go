@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"sort"
 	"strings"
@@ -76,13 +77,23 @@ func (s *Service) InspectArchiveIntegrity(ctx context.Context, f ArchiveIntegrit
 		candidates, err = lister.ListArchived(ctx, ArchiveFilter{CaveSite: f.CaveSite, From: f.From, To: f.To})
 	} else {
 		listed, listErr := s.repo.List(ctx, ListFilter{Status: string(StatusArchived), CaveSite: f.CaveSite, Limit: 100})
-		err = listErr
-		for _, x := range listed.Items {
-			m, e := s.repo.Mission(ctx, x.ID)
-			if e != nil || m.ArchivedAt == nil || f.From != nil && m.ArchivedAt.Before(*f.From) || f.To != nil && m.ArchivedAt.After(*f.To) {
-				continue
+		if listErr != nil {
+			err = listErr
+		} else {
+			for _, x := range listed.Items {
+				m, e := s.repo.Mission(ctx, x.ID)
+				if e != nil {
+					if errors.Is(e, context.Canceled) || errors.Is(e, context.DeadlineExceeded) {
+						err = e
+						break
+					}
+					continue
+				}
+				if m.ArchivedAt == nil || f.From != nil && m.ArchivedAt.Before(*f.From) || f.To != nil && m.ArchivedAt.After(*f.To) {
+					continue
+				}
+				candidates = append(candidates, ArchiveCandidate{ID: m.ID, CaveSite: m.CaveSite, ArchivedAt: *m.ArchivedAt})
 			}
-			candidates = append(candidates, ArchiveCandidate{ID: m.ID, CaveSite: m.CaveSite, ArchivedAt: *m.ArchivedAt})
 		}
 	}
 	if err != nil {
@@ -115,7 +126,10 @@ func (s *Service) InspectArchiveIntegrity(ctx context.Context, f ArchiveIntegrit
 	result := ArchiveIntegrityResult{QueriedAt: s.now().UTC()}
 	result.Summary.Total = len(candidates)
 	for _, c := range candidates {
-		item := s.inspectArchive(ctx, c)
+		item, err := s.inspectArchive(ctx, c)
+		if err != nil {
+			return ArchiveIntegrityResult{}, err
+		}
 		result.Items = append(result.Items, item)
 		switch item.Status {
 		case "complete":
@@ -148,7 +162,7 @@ func archiveTime(t *time.Time) string {
 	return t.UTC().Format(time.RFC3339Nano)
 }
 
-func (s *Service) inspectArchive(ctx context.Context, c ArchiveCandidate) ArchiveIntegrityItem {
+func (s *Service) inspectArchive(ctx context.Context, c ArchiveCandidate) (ArchiveIntegrityItem, error) {
 	item := ArchiveIntegrityItem{MissionID: c.ID, CaveSite: c.CaveSite, ArchivedAt: c.ArchivedAt, Status: "complete"}
 	var m *DiveMission
 	var err error
@@ -158,25 +172,31 @@ func (s *Service) inspectArchive(ctx context.Context, c ArchiveCandidate) Archiv
 		m, err = s.repo.Mission(ctx, c.ID)
 	}
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return ArchiveIntegrityItem{}, err
+		}
 		item.Status, item.FirstFailureLayer = "event_chain_anomaly", "event_chain"
-		return item
+		return item, nil
 	}
 	events, err := s.repo.AllEvents(ctx, c.ID)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return ArchiveIntegrityItem{}, err
+		}
 		item.Status, item.FirstFailureLayer = "event_chain_anomaly", "event_chain"
-		return item
+		return item, nil
 	}
 	if err := audit.Verify(events); err != nil {
 		item.Status, item.FirstFailureLayer = "event_chain_anomaly", "event_chain"
 		item.FailureSequence, item.CurrentDigest = firstBadEvent(events)
-		return item
+		return item, nil
 	}
 	if len(events) < 2 || events[len(events)-1].EventType != "mission_archived" || events[len(events)-2].EventHash != m.ArchiveDigest {
 		item.Status, item.FirstFailureLayer = "archive_digest_anomaly", "archive_digest"
 		if len(events) > 0 {
 			item.FailureSequence, item.CurrentDigest = events[len(events)-1].Sequence, events[len(events)-1].EventHash
 		}
-		return item
+		return item, nil
 	}
 	var archivedPayload struct {
 		AuditChainDigest string `json:"audit_chain_digest"`
@@ -185,7 +205,7 @@ func (s *Service) inspectArchive(ctx context.Context, c ArchiveCandidate) Archiv
 	if archivedPayload.AuditChainDigest != m.ArchiveDigest {
 		item.Status, item.FirstFailureLayer = "archive_digest_anomaly", "archive_digest"
 		item.FailureSequence, item.CurrentDigest = events[len(events)-1].Sequence, events[len(events)-1].EventHash
-		return item
+		return item, nil
 	}
 	signed := false
 	for _, e := range events {
@@ -205,15 +225,15 @@ func (s *Service) inspectArchive(ctx context.Context, c ArchiveCandidate) Archiv
 		if digestErr != nil || p.ReleaseDigest != m.ReleaseDigest || p.ReleaseDigest != expected || !reflect.DeepEqual(p.Checklist, m.ReleaseChecklist) {
 			item.Status, item.FirstFailureLayer = "signed_baseline_anomaly", "signed_baseline"
 			item.FailureSequence, item.CurrentDigest = e.Sequence, e.EventHash
-			return item
+			return item, nil
 		}
 	}
 	if !signed {
 		item.Status, item.FirstFailureLayer = "signed_baseline_anomaly", "signed_baseline"
-		return item
+		return item, nil
 	}
 	item.CurrentDigest = events[len(events)-1].EventHash
-	return item
+	return item, nil
 }
 
 func firstBadEvent(events []audit.Event) (int64, string) {
